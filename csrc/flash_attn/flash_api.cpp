@@ -30,6 +30,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       at::Tensor out,
+                      at::Tensor mask,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
                       void *p_d,
@@ -57,12 +58,16 @@ void set_params_fprop(Flash_fwd_params &params,
     params.o_ptr = out.data_ptr();
     params.o_row_stride = out.stride(-3);
     params.o_head_stride = out.stride(-2);
+    params.m_ptr = mask.data_ptr();
+    params.m_row_stride = m.stride(-3);
+    params.m_head_stride = m.stride(-2);
 
     if (cu_seqlens_q_d == nullptr) {
         params.q_batch_stride = q.stride(0);
         params.k_batch_stride = k.stride(0);
         params.v_batch_stride = v.stride(0);
         params.o_batch_stride = out.stride(0);
+        params.m_batch_stride = m.stride(0);
     }
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
@@ -191,6 +196,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         const float p_dropout,
         const float softmax_scale,
         const bool is_causal,
+        c10::optional<at::Tensor> &mask_,      // batch_size x 1 x seqlen_q x seqlen_k
         const bool return_softmax,
         c10::optional<at::Generator> gen_) {
 
@@ -258,6 +264,18 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         out = torch::empty_like(q_padded);
     }
 
+    at::Tensor mask;
+    if (mask_.has_value()) {
+        mask = mask_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.is_cuda(), "Output tensor must be on CUDA device");
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(mask, batch_size, 1, seqlen_q, seqlen_k);
+    } else {
+        auto opts = q.options();
+        mask = torch::empty({batch_size, 1, seqlen_q, seqlen_k}, opts);
+    }
+
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, 8);
     const int head_size_rounded = round_multiple(head_size, 32);
@@ -285,7 +303,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
+                     q_padded, k_padded, v_padded, out, mask,
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      return_softmax ? p.data_ptr() : nullptr,
